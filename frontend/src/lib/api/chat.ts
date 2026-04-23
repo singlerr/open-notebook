@@ -8,6 +8,10 @@ import {
   NotebookChatMessage,
   BuildContextRequest,
   BuildContextResponse,
+  GenerateNotebookExamRequest,
+  GenerateNotebookExamResponse,
+  GradeNotebookExamRequest,
+  GradeNotebookExamResponse,
 } from '@/lib/types/api'
 
 export const chatApi = {
@@ -62,6 +66,22 @@ export const chatApi = {
   buildContext: async (data: BuildContextRequest) => {
     const response = await apiClient.post<BuildContextResponse>(
       `/chat/context`,
+      data
+    )
+    return response.data
+  },
+
+  generateExam: async (data: GenerateNotebookExamRequest) => {
+    const response = await apiClient.post<GenerateNotebookExamResponse>(
+      `/chat/exam/generate`,
+      data
+    )
+    return response.data
+  },
+
+  gradeExam: async (data: GradeNotebookExamRequest) => {
+    const response = await apiClient.post<GradeNotebookExamResponse>(
+      `/chat/exam/grade`,
       data
     )
     return response.data

@@ -1,19 +1,24 @@
 import asyncio
+import json
 import traceback
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from open_notebook.ai.provision import provision_langchain_model
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.domain.notebook import ChatSession, Note, Notebook, Source
 from open_notebook.exceptions import (
     NotFoundError,
 )
 from open_notebook.graphs.chat import graph as chat_graph
+from open_notebook.utils import clean_thinking_content
 from open_notebook.utils.graph_utils import get_session_message_count
+from open_notebook.utils.text_utils import extract_text_content
 
 router = APIRouter()
 
@@ -88,9 +93,119 @@ class BuildContextResponse(BaseModel):
     char_count: int = Field(..., description="Character count")
 
 
+class GenerateNotebookExamRequest(BaseModel):
+    notebook_id: str = Field(..., description="Notebook ID")
+    prompt: str = Field(..., description="User prompt for exam generation")
+    context_config: Optional[Dict[str, Any]] = Field(
+        None, description="Optional context configuration"
+    )
+    model_override: Optional[str] = Field(
+        None, description="Optional model override for this request"
+    )
+
+
+class GenerateNotebookExamResponse(BaseModel):
+    exam: str = Field(..., description="Generated exam in markdown")
+    token_count: int = Field(..., description="Estimated context token count")
+    char_count: int = Field(..., description="Context character count")
+
+
+class GradeNotebookExamRequest(BaseModel):
+    notebook_id: str = Field(..., description="Notebook ID")
+    prompt: str = Field(..., description="Original user prompt used for exam generation")
+    exam: str = Field(..., description="Exam content to grade against")
+    submission: str = Field(..., description="User's submitted answers")
+    context_config: Optional[Dict[str, Any]] = Field(
+        None, description="Optional context configuration"
+    )
+    model_override: Optional[str] = Field(
+        None, description="Optional model override for this request"
+    )
+
+
+class GradeNotebookExamResponse(BaseModel):
+    result: str = Field(..., description="Detailed grading result in markdown")
+    token_count: int = Field(..., description="Estimated context token count")
+    char_count: int = Field(..., description="Context character count")
+
+
 class SuccessResponse(BaseModel):
     success: bool = Field(True, description="Operation success status")
     message: str = Field(..., description="Success message")
+
+
+async def _build_notebook_context_data(
+    notebook: Notebook, context_config: Optional[Dict[str, Any]]
+) -> tuple[dict[str, list[dict[str, str]]], str]:
+    context_data: dict[str, list[dict[str, str]]] = {"sources": [], "notes": []}
+    total_content = ""
+
+    if context_config:
+        for source_id, status in context_config.get("sources", {}).items():
+            if "not in" in status:
+                continue
+
+            try:
+                full_source_id = (
+                    source_id if source_id.startswith("source:") else f"source:{source_id}"
+                )
+
+                try:
+                    source = await Source.get(full_source_id)
+                except Exception:
+                    continue
+
+                if "insights" in status:
+                    source_context = await source.get_context(context_size="short")
+                    context_data["sources"].append(source_context)
+                    total_content += str(source_context)
+                elif "full content" in status:
+                    source_context = await source.get_context(context_size="long")
+                    context_data["sources"].append(source_context)
+                    total_content += str(source_context)
+            except Exception as e:
+                logger.warning(f"Error processing source {source_id}: {str(e)}")
+                continue
+
+        for note_id, status in context_config.get("notes", {}).items():
+            if "not in" in status:
+                continue
+
+            try:
+                full_note_id = note_id if note_id.startswith("note:") else f"note:{note_id}"
+                note = await Note.get(full_note_id)
+                if not note:
+                    continue
+
+                if "full content" in status:
+                    note_context = note.get_context(context_size="long")
+                    context_data["notes"].append(note_context)
+                    total_content += str(note_context)
+            except Exception as e:
+                logger.warning(f"Error processing note {note_id}: {str(e)}")
+                continue
+    else:
+        sources = await notebook.get_sources()
+        for source in sources:
+            try:
+                source_context = await source.get_context(context_size="short")
+                context_data["sources"].append(source_context)
+                total_content += str(source_context)
+            except Exception as e:
+                logger.warning(f"Error processing source {source.id}: {str(e)}")
+                continue
+
+        notes = await notebook.get_notes()
+        for note in notes:
+            try:
+                note_context = note.get_context(context_size="short")
+                context_data["notes"].append(note_context)
+                total_content += str(note_context)
+            except Exception as e:
+                logger.warning(f"Error processing note {note.id}: {str(e)}")
+                continue
+
+    return context_data, total_content
 
 
 @router.get("/chat/sessions", response_model=List[ChatSessionResponse])
@@ -417,83 +532,9 @@ async def build_context(request: BuildContextRequest):
         if not notebook:
             raise HTTPException(status_code=404, detail="Notebook not found")
 
-        context_data: dict[str, list[dict[str, str]]] = {"sources": [], "notes": []}
-        total_content = ""
-
-        # Process context configuration if provided
-        if request.context_config:
-            # Process sources
-            for source_id, status in request.context_config.get("sources", {}).items():
-                if "not in" in status:
-                    continue
-
-                try:
-                    # Add table prefix if not present
-                    full_source_id = (
-                        source_id
-                        if source_id.startswith("source:")
-                        else f"source:{source_id}"
-                    )
-
-                    try:
-                        source = await Source.get(full_source_id)
-                    except Exception:
-                        continue
-
-                    if "insights" in status:
-                        source_context = await source.get_context(context_size="short")
-                        context_data["sources"].append(source_context)
-                        total_content += str(source_context)
-                    elif "full content" in status:
-                        source_context = await source.get_context(context_size="long")
-                        context_data["sources"].append(source_context)
-                        total_content += str(source_context)
-                except Exception as e:
-                    logger.warning(f"Error processing source {source_id}: {str(e)}")
-                    continue
-
-            # Process notes
-            for note_id, status in request.context_config.get("notes", {}).items():
-                if "not in" in status:
-                    continue
-
-                try:
-                    # Add table prefix if not present
-                    full_note_id = (
-                        note_id if note_id.startswith("note:") else f"note:{note_id}"
-                    )
-                    note = await Note.get(full_note_id)
-                    if not note:
-                        continue
-
-                    if "full content" in status:
-                        note_context = note.get_context(context_size="long")
-                        context_data["notes"].append(note_context)
-                        total_content += str(note_context)
-                except Exception as e:
-                    logger.warning(f"Error processing note {note_id}: {str(e)}")
-                    continue
-        else:
-            # Default behavior - include all sources and notes with short context
-            sources = await notebook.get_sources()
-            for source in sources:
-                try:
-                    source_context = await source.get_context(context_size="short")
-                    context_data["sources"].append(source_context)
-                    total_content += str(source_context)
-                except Exception as e:
-                    logger.warning(f"Error processing source {source.id}: {str(e)}")
-                    continue
-
-            notes = await notebook.get_notes()
-            for note in notes:
-                try:
-                    note_context = note.get_context(context_size="short")
-                    context_data["notes"].append(note_context)
-                    total_content += str(note_context)
-                except Exception as e:
-                    logger.warning(f"Error processing note {note.id}: {str(e)}")
-                    continue
+        context_data, total_content = await _build_notebook_context_data(
+            notebook, request.context_config
+        )
 
         # Calculate character and token counts
         char_count = len(total_content)
@@ -514,3 +555,105 @@ async def build_context(request: BuildContextRequest):
     except Exception as e:
         logger.error(f"Error building context: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error building context: {str(e)}")
+
+
+@router.post("/chat/exam/generate", response_model=GenerateNotebookExamResponse)
+async def generate_notebook_exam(request: GenerateNotebookExamRequest):
+    """Generate exam questions from notebook context using user prompt."""
+    try:
+        notebook = await Notebook.get(request.notebook_id)
+        if not notebook:
+            raise HTTPException(status_code=404, detail="Notebook not found")
+
+        context_data, total_content = await _build_notebook_context_data(
+            notebook, request.context_config
+        )
+        context_json = json.dumps(context_data, ensure_ascii=False)
+
+        system_prompt = (
+            "You are an expert exam author.\n"
+            "Create a high-quality exam based only on the provided notebook context and user request.\n"
+            "Return markdown only.\n"
+            "Include: exam title, student instructions, numbered questions with points, and total score."
+        )
+        user_prompt = (
+            f"User request:\n{request.prompt}\n\n"
+            f"Notebook context:\n{context_json}"
+        )
+
+        payload = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        model = await provision_langchain_model(
+            str(payload), request.model_override, "chat", max_tokens=8192
+        )
+        ai_message = await asyncio.to_thread(model.invoke, payload)
+        exam_content = clean_thinking_content(extract_text_content(ai_message.content))
+
+        char_count = len(total_content)
+        try:
+            from open_notebook.utils import token_count
+
+            estimated_tokens = token_count(total_content) if total_content else 0
+        except ImportError:
+            estimated_tokens = char_count // 4
+
+        return GenerateNotebookExamResponse(
+            exam=exam_content, token_count=estimated_tokens, char_count=char_count
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating notebook exam: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error generating notebook exam: {str(e)}"
+        )
+
+
+@router.post("/chat/exam/grade", response_model=GradeNotebookExamResponse)
+async def grade_notebook_exam(request: GradeNotebookExamRequest):
+    """Grade a user's exam submission based on notebook context."""
+    try:
+        notebook = await Notebook.get(request.notebook_id)
+        if not notebook:
+            raise HTTPException(status_code=404, detail="Notebook not found")
+
+        context_data, total_content = await _build_notebook_context_data(
+            notebook, request.context_config
+        )
+        context_json = json.dumps(context_data, ensure_ascii=False)
+
+        system_prompt = (
+            "You are an expert exam grader.\n"
+            "Evaluate the student's answers against the exam and notebook context.\n"
+            "Return markdown only.\n"
+            "Include: total score, per-question grading, corrected guidance, and summary feedback."
+        )
+        user_prompt = (
+            f"Original user request:\n{request.prompt}\n\n"
+            f"Exam:\n{request.exam}\n\n"
+            f"Student submission:\n{request.submission}\n\n"
+            f"Notebook context:\n{context_json}"
+        )
+
+        payload = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        model = await provision_langchain_model(
+            str(payload), request.model_override, "chat", max_tokens=8192
+        )
+        ai_message = await asyncio.to_thread(model.invoke, payload)
+        grading_result = clean_thinking_content(extract_text_content(ai_message.content))
+
+        char_count = len(total_content)
+        try:
+            from open_notebook.utils import token_count
+
+            estimated_tokens = token_count(total_content) if total_content else 0
+        except ImportError:
+            estimated_tokens = char_count // 4
+
+        return GradeNotebookExamResponse(
+            result=grading_result, token_count=estimated_tokens, char_count=char_count
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error grading notebook exam: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error grading notebook exam: {str(e)}")

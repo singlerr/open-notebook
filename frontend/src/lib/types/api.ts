@@ -239,3 +239,37 @@ export interface BuildContextResponse {
   token_count: number
   char_count: number
 }
+
+export interface GenerateNotebookExamRequest {
+  notebook_id: string
+  prompt: string
+  context_config: {
+    sources: Record<string, string>
+    notes: Record<string, string>
+  }
+  model_override?: string
+}
+
+export interface GenerateNotebookExamResponse {
+  exam: string
+  token_count: number
+  char_count: number
+}
+
+export interface GradeNotebookExamRequest {
+  notebook_id: string
+  prompt: string
+  exam: string
+  submission: string
+  context_config: {
+    sources: Record<string, string>
+    notes: Record<string, string>
+  }
+  model_override?: string
+}
+
+export interface GradeNotebookExamResponse {
+  result: string
+  token_count: number
+  char_count: number
+}

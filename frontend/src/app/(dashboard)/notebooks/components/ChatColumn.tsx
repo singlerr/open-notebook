@@ -1,15 +1,17 @@
 'use client'
 
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNotebookChat } from '@/lib/hooks/useNotebookChat'
 import { useNotes } from '@/lib/hooks/use-notes'
 import { ChatPanel } from '@/components/source/ChatPanel'
 import { LoadingSpinner } from '@/components/common/LoadingSpinner'
 import { Card, CardContent } from '@/components/ui/card'
-import { AlertCircle } from 'lucide-react'
+import { AlertCircle, MessageSquare, ScrollText } from 'lucide-react'
 import { ContextSelections } from '../[id]/page'
 import { useTranslation } from '@/lib/hooks/use-translation'
 import { SourceListResponse } from '@/lib/types/api'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { NotebookExamPanel } from './NotebookExamPanel'
 
 interface ChatColumnProps {
   notebookId: string
@@ -20,6 +22,7 @@ interface ChatColumnProps {
 
 export function ChatColumn({ notebookId, contextSelections, sources, sourcesLoading }: ChatColumnProps) {
   const { t } = useTranslation()
+  const [activeTab, setActiveTab] = useState<'chat' | 'exam'>('chat')
 
   // Fetch notes for this notebook
   const { data: notes = [], isLoading: notesLoading } = useNotes(notebookId)
@@ -92,24 +95,50 @@ export function ChatColumn({ notebookId, contextSelections, sources, sourcesLoad
   }
 
   return (
-    <ChatPanel
-      title={t('chat.chatWithNotebook')}
-      contextType="notebook"
-      messages={chat.messages}
-      isStreaming={chat.isSending}
-      contextIndicators={null}
-      onSendMessage={(message, modelOverride) => chat.sendMessage(message, modelOverride)}
-      modelOverride={chat.currentSession?.model_override ?? chat.pendingModelOverride ?? undefined}
-      onModelChange={(model) => chat.setModelOverride(model ?? null)}
-      sessions={chat.sessions}
-      currentSessionId={chat.currentSessionId}
-      onCreateSession={(title) => chat.createSession(title)}
-      onSelectSession={chat.switchSession}
-      onUpdateSession={(sessionId, title) => chat.updateSession(sessionId, { title })}
-      onDeleteSession={chat.deleteSession}
-      loadingSessions={chat.loadingSessions}
-      notebookContextStats={contextStats}
-      notebookId={notebookId}
-    />
+    <div className="h-full flex flex-col gap-3">
+      <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as 'chat' | 'exam')}>
+        <TabsList className="grid w-full grid-cols-2">
+          <TabsTrigger value="chat" className="gap-2">
+            <MessageSquare className="h-4 w-4" />
+            {t('common.chat')}
+          </TabsTrigger>
+          <TabsTrigger value="exam" className="gap-2">
+            <ScrollText className="h-4 w-4" />
+            {t('exam.title')}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      <div className="flex-1 min-h-0">
+        {activeTab === 'chat' ? (
+          <ChatPanel
+            title={t('chat.chatWithNotebook')}
+            contextType="notebook"
+            messages={chat.messages}
+            isStreaming={chat.isSending}
+            contextIndicators={null}
+            onSendMessage={(message, modelOverride) => chat.sendMessage(message, modelOverride)}
+            modelOverride={chat.currentSession?.model_override ?? chat.pendingModelOverride ?? undefined}
+            onModelChange={(model) => chat.setModelOverride(model ?? null)}
+            sessions={chat.sessions}
+            currentSessionId={chat.currentSessionId}
+            onCreateSession={(title) => chat.createSession(title)}
+            onSelectSession={chat.switchSession}
+            onUpdateSession={(sessionId, title) => chat.updateSession(sessionId, { title })}
+            onDeleteSession={chat.deleteSession}
+            loadingSessions={chat.loadingSessions}
+            notebookContextStats={contextStats}
+            notebookId={notebookId}
+          />
+        ) : (
+          <NotebookExamPanel
+            notebookId={notebookId}
+            sources={sources}
+            notes={notes}
+            contextSelections={contextSelections}
+          />
+        )}
+      </div>
+    </div>
   )
 }
